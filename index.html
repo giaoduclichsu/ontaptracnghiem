@@ -1,0 +1,1090 @@
+<!doctype html>
+<html lang="vi">
+ <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ứng Dụng Trắc Nghiệm</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+  <script src="/_sdk/data_sdk.js"></script>
+  <script src="/_sdk/element_sdk.js"></script>
+  <style>
+    body {
+      box-sizing: border-box;
+    }
+    .loading-spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #3b82f6;
+      border-radius: 50%;
+      width: 24px;
+      height: 24px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      padding: 16px 24px;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      z-index: 1000;
+      animation: slideIn 0.3s ease-out;
+    }
+    @keyframes slideIn {
+      from {
+        transform: translateX(400px);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+  </style>
+  <style>@view-transition { navigation: auto; }</style>
+ </head>
+ <body class="w-full min-h-full">
+  <div id="app" class="w-full min-h-full"></div>
+  <script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+    const defaultConfig = {
+      background_color: "#f0f4f8",
+      surface_color: "#ffffff",
+      text_color: "#1e293b",
+      primary_action_color: "#3b82f6",
+      secondary_action_color: "#64748b",
+      font_family: "Inter",
+      font_size: 16,
+      app_title: "Ứng Dụng Trắc Nghiệm",
+      upload_instruction: "Upload file PDF hoặc DOCX chứa câu hỏi. Ghi chú đáp án đúng (A/B/C/D) bên dưới mỗi câu hỏi."
+    };
+
+    let questions = [];
+    let currentView = 'upload';
+    let isShuffled = false;
+    let currentQuestionIndex = 0;
+    let userAnswers = {};
+    let isLoading = false;
+    let quizStartIndex = 0;
+    let quizEndIndex = 0;
+    let instantFeedback = false;
+
+    function showToast(message, type = 'success') {
+      const toast = document.createElement('div');
+      toast.className = `toast ${type === 'success' ? 'bg-green-500' : 'bg-red-500'} text-white`;
+      toast.textContent = message;
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+
+    function generateId() {
+      return Date.now().toString() + Math.random().toString(36).substr(2, 9);
+    }
+
+    async function extractQuestionsFromPDF(file) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = '';
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map(item => item.str).join(' ');
+          fullText += pageText + '\n';
+        }
+
+        return parseQuestions(fullText);
+      } catch (error) {
+        throw new Error('Không thể đọc file PDF');
+      }
+    }
+
+    async function extractQuestionsFromDOCX(file) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const result = await mammoth.extractRawText({ arrayBuffer: arrayBuffer });
+        const fullText = result.value;
+        
+        return parseQuestions(fullText);
+      } catch (error) {
+        throw new Error('Không thể đọc file DOCX');
+      }
+    }
+
+    function parseQuestions(text) {
+      // Chu���n hóa text - loại bỏ ký tự đặc biệt nhưng giữ cấu trúc
+      text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      // Loại bỏ các khoảng trắng thừa nhưng giữ ngắt dòng
+      text = text.replace(/[ \t]+/g, ' ');
+      
+      const extractedQuestions = [];
+      
+      // Tìm tất cả vị trí bắt đầu của câu hỏi - hỗ trợ nhiều định dạng
+      const questionStarts = [];
+      // Pattern linh hoạt hơn: "Câu 1." hoặc "Câu 1:" hoặc "Câu 1 "
+      const regex = /(?:^|\n)\s*(Câu\s+(\d+)[\.\:\s])/gi;
+      let match;
+      
+      while ((match = regex.exec(text)) !== null) {
+        questionStarts.push({
+          index: match.index,
+          number: parseInt(match[2]),
+          fullMatch: match[1],
+          startOfContent: match.index + match[0].length
+        });
+      }
+      
+      console.log(`Tìm thấy ${questionStarts.length} câu hỏi`);
+      
+      // Xử lý từng câu hỏi
+      for (let i = 0; i < questionStarts.length; i++) {
+        const start = questionStarts[i];
+        const end = i < questionStarts.length - 1 ? questionStarts[i + 1].index : text.length;
+        
+        let block = text.substring(start.index, end).trim();
+        if (!block || block.length < 15) continue;
+        
+        // Tạo đối tượng câu hỏi
+        const currentQuestion = {
+          id: generateId(),
+          question: '',
+          option_a: '',
+          option_b: '',
+          option_c: '',
+          option_d: '',
+          correct_answer: '',
+          created_at: new Date().toISOString()
+        };
+        
+        // Loại bỏ phần "Câu X." ở đầu
+        block = block.replace(/^Câu\s+\d+[\.\:\s]+/i, '');
+        
+        // Tách câu hỏi (từ đầu đến trước đáp án A)
+        // Tìm vị trí đầu tiên của "A." hoặc "A)"
+        const optionAStart = block.search(/(?:\n|^)\s*A[\.\)]\s/i);
+        
+        if (optionAStart !== -1) {
+          currentQuestion.question = block.substring(0, optionAStart)
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        } else {
+          // Nếu không tìm thấy pattern chu��n, thử tìm "A." không có newline
+          const altStart = block.search(/\s+A[\.\)]\s/i);
+          if (altStart !== -1) {
+            currentQuestion.question = block.substring(0, altStart)
+              .replace(/\n+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+        }
+        
+        // Tìm vị trí các đáp án với pattern linh hoạt hơn
+        const findOptionPosition = (letter) => {
+          // Thử nhiều pattern khác nhau
+          const patterns = [
+            new RegExp(`(?:\\n|^)\\s*${letter}[\\.\\)]\\s`, 'i'),
+            new RegExp(`\\s${letter}[\\.\\)]\\s`, 'i'),
+            new RegExp(`${letter}[\\.\\)]\\s`, 'i')
+          ];
+          
+          for (const pattern of patterns) {
+            const pos = block.search(pattern);
+            if (pos !== -1) return pos;
+          }
+          return -1;
+        };
+        
+        const optionAMatch = findOptionPosition('A');
+        const optionBMatch = findOptionPosition('B');
+        const optionCMatch = findOptionPosition('C');
+        const optionDMatch = findOptionPosition('D');
+        
+        // Tìm vị trí đáp án
+        const answerKeywords = ['Đáp án đúng', 'Đáp án', 'Answer', 'Correct answer', 'ĐÁP ÁN'];
+        let answerMatch = -1;
+        for (const keyword of answerKeywords) {
+          const pos = block.search(new RegExp(keyword, 'i'));
+          if (pos !== -1) {
+            answerMatch = pos;
+            break;
+          }
+        }
+        
+        // Trích xuất đáp án A
+        if (optionAMatch !== -1 && optionBMatch !== -1) {
+          let optionA = block.substring(optionAMatch, optionBMatch);
+          optionA = optionA.replace(/^\s*A[\.\)]\s*/i, '')
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          currentQuestion.option_a = optionA;
+        }
+        
+        // Trích xuất đáp án B
+        if (optionBMatch !== -1 && optionCMatch !== -1) {
+          let optionB = block.substring(optionBMatch, optionCMatch);
+          optionB = optionB.replace(/^\s*B[\.\)]\s*/i, '')
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          currentQuestion.option_b = optionB;
+        }
+        
+        // Trích xuất đáp án C
+        if (optionCMatch !== -1 && optionDMatch !== -1) {
+          let optionC = block.substring(optionCMatch, optionDMatch);
+          optionC = optionC.replace(/^\s*C[\.\)]\s*/i, '')
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          currentQuestion.option_c = optionC;
+        }
+        
+        // Trích xuất đáp án D
+        if (optionDMatch !== -1) {
+          const endPos = answerMatch !== -1 ? answerMatch : block.length;
+          let optionD = block.substring(optionDMatch, endPos);
+          optionD = optionD.replace(/^\s*D[\.\)]\s*/i, '')
+            .replace(/\n+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          currentQuestion.option_d = optionD;
+        }
+        
+        // Tìm đáp án đúng với nhiều pattern
+        const answerPatterns = [
+          /Đáp\s*án\s*đúng[\s\:\.\-]*([A-D])/i,
+          /Đáp\s*án[\s\:\.\-]*([A-D])/i,
+          /\(Đáp\s*án\s*đúng[\s\:\.\-]*([A-D])\)/i,
+          /\(Đáp\s*án[\s\:\.\-]*([A-D])\)/i,
+          /Answer[\s\:\.\-]*([A-D])/i,
+          /Correct[\s\:\.\-]*([A-D])/i,
+          /ĐÁP\s*ÁN[\s\:\.\-]*([A-D])/i,
+          /\(([A-D])\)\s*$/i, // Đáp án ở cuối trong ngoặc
+          /:\s*([A-D])\s*$/i  // Đáp án ở cuối sau dấu :
+        ];
+        
+        for (const pattern of answerPatterns) {
+          const answerMatch = block.match(pattern);
+          if (answerMatch) {
+            currentQuestion.correct_answer = answerMatch[1].toUpperCase();
+            break;
+          }
+        }
+        
+        // Nếu vẫn chưa tìm thấy, thử tìm chữ đơn A/B/C/D ở cuối
+        if (!currentQuestion.correct_answer) {
+          const lines = block.split('\n').map(l => l.trim()).filter(l => l);
+          const lastLine = lines[lines.length - 1];
+          if (lastLine && /^[A-D]$/i.test(lastLine)) {
+            currentQuestion.correct_answer = lastLine.toUpperCase();
+          }
+        }
+        
+        // Chỉ thêm câu hỏi nếu có đủ thông tin tối thiểu
+        if (currentQuestion.question && 
+            currentQuestion.option_a && 
+            currentQuestion.option_b &&
+            currentQuestion.correct_answer) {
+          extractedQuestions.push(currentQuestion);
+        }
+      }
+      
+      console.log(`Trích xuất thành công ${extractedQuestions.length} câu hỏi`);
+      
+      // Nếu không tìm thấy đủ câu hỏi, thử phương pháp dự phòng
+      if (extractedQuestions.length < 10) {
+        console.log('Số câu quá ít, thử phương pháp dự phòng...');
+        return parseQuestionsSimple(text);
+      }
+      
+      return extractedQuestions;
+    }
+    
+    function parseQuestionsSimple(text) {
+      const extractedQuestions = [];
+      
+      // Tách theo câu hỏi bằng regex linh hoạt hơn
+      const questionBlocks = text.split(/(?=(?:Câu|câu)\s*\d+|\d+[\.\)])/i);
+      
+      for (let block of questionBlocks) {
+        block = block.trim();
+        if (!block) continue;
+        
+        const lines = block.split(/\n|\r\n/).map(l => l.trim()).filter(l => l);
+        let currentQuestion = {
+          id: generateId(),
+          question: '',
+          option_a: '',
+          option_b: '',
+          option_c: '',
+          option_d: '',
+          correct_answer: '',
+          created_at: new Date().toISOString()
+        };
+        
+        let foundQuestion = false;
+        
+        for (let line of lines) {
+          // Câu h���i
+          if (!foundQuestion && (line.match(/^(Câu|câu)\s*\d+/i) || line.match(/^\d+[\.\)]/))) {
+            currentQuestion.question = line.replace(/^(Câu|câu)\s*\d+[\.\:\)]?\s*/i, '').replace(/^\d+[\.\)]\s*/, '').trim();
+            foundQuestion = true;
+          }
+          // Nối tiếp câu hỏi
+          else if (foundQuestion && !currentQuestion.option_a && !line.match(/^[A-D][\.\)]/i)) {
+            currentQuestion.question += ' ' + line;
+          }
+          // Đáp án A, B, C, D
+          else if (line.match(/^A[\.\)]/i)) {
+            currentQuestion.option_a = line.replace(/^A[\.\)]\s*/i, '').split(/(?:Đáp án|đáp án|Answer|answer)[\s\:]+[A-D]/i)[0].trim();
+          }
+          else if (line.match(/^B[\.\)]/i)) {
+            currentQuestion.option_b = line.replace(/^B[\.\)]\s*/i, '').split(/(?:Đáp án|đáp án|Answer|answer)[\s\:]+[A-D]/i)[0].trim();
+          }
+          else if (line.match(/^C[\.\)]/i)) {
+            currentQuestion.option_c = line.replace(/^C[\.\)]\s*/i, '').split(/(?:Đáp án|đáp án|Answer|answer)[\s\:]+[A-D]/i)[0].trim();
+          }
+          else if (line.match(/^D[\.\)]/i)) {
+            currentQuestion.option_d = line.replace(/^D[\.\)]\s*/i, '').split(/(?:Đáp án|đáp án|Answer|answer)[\s\:]+[A-D]/i)[0].trim();
+          }
+          // Đáp án đúng - nhiều định dạng
+          else if (line.match(/(Đáp\s*án\s*đúng|Đáp\s*án|Answer|answer|Đ\/A|đ\/a)[\s\:]*([A-D])/i)) {
+            const match = line.match(/([A-D])/i);
+            if (match) {
+              currentQuestion.correct_answer = match[1].toUpperCase();
+            }
+          }
+        }
+        
+        // Chỉ thêm nếu có đủ câu hỏi và ít nhất 2 đáp án
+        if (currentQuestion.question && currentQuestion.option_a && currentQuestion.option_b) {
+          extractedQuestions.push(currentQuestion);
+        }
+      }
+      
+      return extractedQuestions;
+    }
+
+    async function handleFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const isPDF = file.type === 'application/pdf';
+      const isDOCX = file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+      if (!isPDF && !isDOCX) {
+        showToast('Vui lòng chọn file PDF hoặc DOCX', 'error');
+        return;
+      }
+
+      isLoading = true;
+      render();
+
+      try {
+        let extractedQuestions;
+        
+        if (isPDF) {
+          extractedQuestions = await extractQuestionsFromPDF(file);
+        } else {
+          extractedQuestions = await extractQuestionsFromDOCX(file);
+        }
+        
+        if (extractedQuestions.length === 0) {
+          showToast('Không tìm thấy câu hỏi trong file', 'error');
+          isLoading = false;
+          render();
+          return;
+        }
+
+        for (const question of extractedQuestions) {
+          const result = await window.dataSdk.create(question);
+          if (!result.isOk) {
+            showToast('Lỗi khi lưu câu hỏi', 'error');
+          }
+        }
+
+        showToast(`Đã nhập ${extractedQuestions.length} câu hỏi thành công`);
+        event.target.value = '';
+      } catch (error) {
+        showToast(error.message || 'Lỗi khi xử lý file', 'error');
+      } finally {
+        isLoading = false;
+        render();
+      }
+    }
+
+    function shuffleArray(array) {
+      const shuffled = [...array];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      return shuffled;
+    }
+
+    function showQuizSettings() {
+      currentView = 'quiz-settings';
+      quizStartIndex = 0;
+      quizEndIndex = questions.length > 0 ? questions.length - 1 : 0;
+      render();
+    }
+
+    function applyQuizSettings() {
+      const startVal = parseInt(document.getElementById('startQuestion').value);
+      const endVal = parseInt(document.getElementById('endQuestion').value);
+      const shuffle = document.getElementById('shuffleCheck').checked;
+      const instant = document.getElementById('instantFeedbackCheck').checked;
+
+      if (isNaN(startVal) || isNaN(endVal)) {
+        showToast('Vui lòng nhập số hợp lệ', 'error');
+        return;
+      }
+
+      if (startVal < 1 || startVal > questions.length) {
+        showToast(`Câu bắt đầu phải từ 1 đến ${questions.length}`, 'error');
+        return;
+      }
+
+      if (endVal < 1 || endVal > questions.length) {
+        showToast(`Câu kết thúc phải từ 1 đến ${questions.length}`, 'error');
+        return;
+      }
+
+      if (startVal > endVal) {
+        showToast('Câu bắt đầu phải nhỏ hơn câu kết thúc', 'error');
+        return;
+      }
+
+      quizStartIndex = startVal - 1;
+      quizEndIndex = endVal - 1;
+
+      startQuiz(shuffle, instant);
+    }
+
+    function startQuiz(shuffle = false, instant = false) {
+      if (questions.length === 0) {
+        showToast('Chưa có câu hỏi nào', 'error');
+        return;
+      }
+
+      currentView = 'quiz';
+      isShuffled = shuffle;
+      instantFeedback = instant;
+      currentQuestionIndex = quizStartIndex;
+      userAnswers = {};
+      
+      if (shuffle) {
+        const selectedQuestions = questions.slice(quizStartIndex, quizEndIndex + 1);
+        const shuffled = shuffleArray(selectedQuestions);
+        questions = [...questions.slice(0, quizStartIndex), ...shuffled, ...questions.slice(quizEndIndex + 1)];
+      }
+      
+      render();
+    }
+
+    function selectAnswer(answer) {
+      userAnswers[currentQuestionIndex] = answer;
+      render();
+    }
+
+    function nextQuestion() {
+      if (currentQuestionIndex < quizEndIndex) {
+        currentQuestionIndex++;
+        render();
+      }
+    }
+
+    function previousQuestion() {
+      if (currentQuestionIndex > quizStartIndex) {
+        currentQuestionIndex--;
+        render();
+      }
+    }
+
+    function submitQuiz() {
+      currentView = 'results';
+      render();
+    }
+
+    function calculateScore() {
+      let correct = 0;
+      for (let i = quizStartIndex; i <= quizEndIndex; i++) {
+        if (userAnswers[i] === questions[i].correct_answer) {
+          correct++;
+        }
+      }
+      return correct;
+    }
+    
+    function getTotalQuestions() {
+      return quizEndIndex - quizStartIndex + 1;
+    }
+
+    function backToUpload() {
+      currentView = 'upload';
+      currentQuestionIndex = 0;
+      userAnswers = {};
+      isShuffled = false;
+      instantFeedback = false;
+      quizStartIndex = 0;
+      quizEndIndex = questions.length > 0 ? questions.length - 1 : 0;
+      render();
+    }
+
+    async function deleteQuestion(question) {
+      const btn = event.target;
+      if (btn.textContent === 'Xóa') {
+        btn.textContent = 'Xác nhận xóa?';
+        btn.classList.remove('bg-red-500', 'hover:bg-red-600');
+        btn.classList.add('bg-red-600');
+        setTimeout(() => {
+          if (btn.textContent === 'Xác nhận xóa?') {
+            btn.textContent = 'Xóa';
+            btn.classList.remove('bg-red-600');
+            btn.classList.add('bg-red-500', 'hover:bg-red-600');
+          }
+        }, 3000);
+        return;
+      }
+
+      isLoading = true;
+      render();
+
+      const result = await window.dataSdk.delete(question);
+      
+      isLoading = false;
+
+      if (result.isOk) {
+        showToast('Đã xóa câu hỏi');
+      } else {
+        showToast('Lỗi khi xóa câu hỏi', 'error');
+      }
+      
+      render();
+    }
+
+    function render() {
+      const config = window.elementSdk?.config || defaultConfig;
+      const app = document.getElementById('app');
+      
+      const baseSize = config.font_size || defaultConfig.font_size;
+      const fontFamily = `${config.font_family || defaultConfig.font_family}, Inter, system-ui, -apple-system, sans-serif`;
+      
+      app.style.backgroundColor = config.background_color || defaultConfig.background_color;
+      app.style.color = config.text_color || defaultConfig.text_color;
+      app.style.fontFamily = fontFamily;
+      app.style.fontSize = `${baseSize}px`;
+
+      if (currentView === 'upload') {
+        app.innerHTML = `
+          <div class="w-full min-h-full p-8">
+            <div class="max-w-4xl mx-auto">
+              <h1 class="font-bold mb-8 text-center" style="font-size: ${baseSize * 2}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                ${config.app_title || defaultConfig.app_title}
+              </h1>
+              
+              <div class="rounded-lg shadow-lg p-8 mb-6" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                <h2 class="font-semibold mb-4" style="font-size: ${baseSize * 1.5}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  Upload Câu Hỏi
+                </h2>
+                <p class="mb-6" style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.8;">
+                  ${config.upload_instruction || defaultConfig.upload_instruction}
+                </p>
+                
+                <label class="block w-full p-6 border-2 border-dashed rounded-lg text-center cursor-pointer transition-colors" 
+                       style="border-color: ${config.primary_action_color || defaultConfig.primary_action_color}; color: ${config.primary_action_color || defaultConfig.primary_action_color};"
+                       onmouseover="this.style.backgroundColor='${config.primary_action_color || defaultConfig.primary_action_color}15'"
+                       onmouseout="this.style.backgroundColor='transparent'">
+                  <input type="file" id="pdfInput" accept=".pdf,.docx" class="hidden" ${isLoading ? 'disabled' : ''}>
+                  <span style="font-size: ${baseSize * 1.2}px; font-family: ${fontFamily};">
+                    ${isLoading ? '��� Đang xử lý...' : '📄 Ch����n file PDF hoặc DOCX'}
+                  </span>
+                </label>
+              </div>
+
+              ${questions.length > 0 ? `
+                <div class="rounded-lg shadow-lg p-8 mb-6" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                  <div class="flex justify-between items-center mb-4">
+                    <h2 class="font-semibold" style="font-size: ${baseSize * 1.5}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                      Danh Sách Câu Hỏi (${questions.length})
+                    </h2>
+                  </div>
+                  <div class="space-y-3 max-h-96 overflow-y-auto">
+                    ${questions.map((q, index) => `
+                      <div class="p-4 rounded-lg flex justify-between items-start" style="background-color: ${config.background_color || defaultConfig.background_color};">
+                        <div class="flex-1">
+                          <p class="font-medium mb-2" style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                            ${index + 1}. ${q.question}
+                          </p>
+                          <p style="font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.7;">
+                            Đáp án: ${q.correct_answer || 'Chưa có'}
+                          </p>
+                        </div>
+                        <button onclick="deleteQuestion(questions[${index}])" 
+                                class="ml-4 px-4 py-2 rounded-lg transition-colors text-white bg-red-500 hover:bg-red-600"
+                                style="font-size: ${baseSize * 0.85}px; font-family: ${fontFamily};"
+                                ${isLoading ? 'disabled' : ''}>
+                          Xóa
+                        </button>
+                      </div>
+                    `).join('')}
+                  </div>
+                </div>
+
+                <button onclick="showQuizSettings()" 
+                        class="w-full py-4 rounded-lg font-semibold text-white transition-colors"
+                        style="background-color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-size: ${baseSize * 1.1}px; font-family: ${fontFamily};"
+                        onmouseover="this.style.opacity='0.9'"
+                        onmouseout="this.style.opacity='1'">
+                  📝 Bắt Đầu Làm Bài
+                </button>
+              ` : ''}
+            </div>
+          </div>
+        `;
+
+        document.getElementById('pdfInput').addEventListener('change', handleFileUpload);
+      } else if (currentView === 'quiz-settings') {
+        app.innerHTML = `
+          <div class="w-full min-h-full p-8">
+            <div class="max-w-2xl mx-auto">
+              <button onclick="backToUpload()" 
+                      class="mb-6 px-4 py-2 rounded-lg text-white transition-colors"
+                      style="background-color: ${config.secondary_action_color || defaultConfig.secondary_action_color}; font-size: ${baseSize * 0.9}px; font-family: ${fontFamily};"
+                      onmouseover="this.style.opacity='0.9'"
+                      onmouseout="this.style.opacity='1'">
+                ← Quay Lại
+              </button>
+
+              <div class="rounded-lg shadow-lg p-8 mb-6" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                <h1 class="font-bold mb-6 text-center" style="font-size: ${baseSize * 2}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  Cài Đặt Bài Thi
+                </h1>
+
+                <div class="mb-6">
+                  <label class="block font-semibold mb-3" style="font-size: ${baseSize * 1.1}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                    Chọn phạm vi câu hỏi
+                  </label>
+                  
+                  <div class="grid grid-cols-2 gap-4 mb-4">
+                    <div>
+                      <label class="block mb-2" style="font-size: ${baseSize * 0.9}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.8;">
+                        Từ câu:
+                      </label>
+                      <input type="number" id="startQuestion" min="1" max="${questions.length}" value="${quizStartIndex + 1}"
+                             class="w-full p-3 rounded-lg border-2"
+                             style="font-size: ${baseSize}px; font-family: ${fontFamily}; border-color: ${config.secondary_action_color || defaultConfig.secondary_action_color};">
+                    </div>
+                    <div>
+                      <label class="block mb-2" style="font-size: ${baseSize * 0.9}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.8;">
+                        Đến câu:
+                      </label>
+                      <input type="number" id="endQuestion" min="1" max="${questions.length}" value="${quizEndIndex + 1}"
+                             class="w-full p-3 rounded-lg border-2"
+                             style="font-size: ${baseSize}px; font-family: ${fontFamily}; border-color: ${config.secondary_action_color || defaultConfig.secondary_action_color};">
+                    </div>
+                  </div>
+
+                  <div class="flex gap-2 flex-wrap">
+                    <button onclick="document.getElementById('startQuestion').value=1; document.getElementById('endQuestion').value=${questions.length}"
+                            class="px-4 py-2 rounded-lg transition-colors"
+                            style="background-color: ${config.background_color || defaultConfig.background_color}; color: ${config.text_color || defaultConfig.text_color}; font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; border: 1px solid ${config.secondary_action_color || defaultConfig.secondary_action_color};"
+                            onmouseover="this.style.opacity='0.8'"
+                            onmouseout="this.style.opacity='1'">
+                      Tất cả (${questions.length} câu)
+                    </button>
+                    <button onclick="document.getElementById('startQuestion').value=1; document.getElementById('endQuestion').value=15"
+                            class="px-4 py-2 rounded-lg transition-colors"
+                            style="background-color: ${config.background_color || defaultConfig.background_color}; color: ${config.text_color || defaultConfig.text_color}; font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; border: 1px solid ${config.secondary_action_color || defaultConfig.secondary_action_color};"
+                            onmouseover="this.style.opacity='0.8'"
+                            onmouseout="this.style.opacity='1'">
+                      Câu 1-15
+                    </button>
+                    <button onclick="document.getElementById('startQuestion').value=16; document.getElementById('endQuestion').value=30"
+                            class="px-4 py-2 rounded-lg transition-colors"
+                            style="background-color: ${config.background_color || defaultConfig.background_color}; color: ${config.text_color || defaultConfig.text_color}; font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; border: 1px solid ${config.secondary_action_color || defaultConfig.secondary_action_color};"
+                            onmouseover="this.style.opacity='0.8'"
+                            onmouseout="this.style.opacity='1'">
+                      Câu 16-30
+                    </button>
+                  </div>
+                </div>
+
+                <div class="mb-6 p-4 rounded-lg" style="background-color: ${config.background_color || defaultConfig.background_color};">
+                  <label class="flex items-center cursor-pointer">
+                    <input type="checkbox" id="instantFeedbackCheck" class="mr-3" style="width: 20px; height: 20px;">
+                    <div>
+                      <div class="font-semibold" style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                        ⚡ Chấm điểm ngay lập tức
+                      </div>
+                      <div style="font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.7;">
+                        Hiển thị đúng/sai ngay sau khi chọn đáp án
+                      </div>
+                    </div>
+                  </label>
+                </div>
+
+                <div class="mb-6 p-4 rounded-lg" style="background-color: ${config.background_color || defaultConfig.background_color};">
+                  <label class="flex items-center cursor-pointer">
+                    <input type="checkbox" id="shuffleCheck" class="mr-3" style="width: 20px; height: 20px;">
+                    <div>
+                      <div class="font-semibold" style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                        ��� Trộn câu hỏi
+                      </div>
+                      <div style="font-size: ${baseSize * 0.85}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.7;">
+                        Xáo trộn thứ tự các câu hỏi trong phạm vi đã chọn
+                      </div>
+                    </div>
+                  </label>
+                </div>
+
+                <button onclick="applyQuizSettings()" 
+                        class="w-full py-4 rounded-lg font-semibold text-white transition-colors"
+                        style="background-color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-size: ${baseSize * 1.2}px; font-family: ${fontFamily};"
+                        onmouseover="this.style.opacity='0.9'"
+                        onmouseout="this.style.opacity='1'">
+                  Bắt Đầu Làm Bài
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (currentView === 'quiz') {
+        const q = questions[currentQuestionIndex];
+        const options = ['A', 'B', 'C', 'D'];
+        const userAnswer = userAnswers[currentQuestionIndex];
+        const showFeedback = instantFeedback && userAnswer;
+        
+        app.innerHTML = `
+          <div class="w-full min-h-full p-8">
+            <div class="max-w-3xl mx-auto">
+              <div class="flex justify-between items-center mb-6">
+                <button onclick="backToUpload()" 
+                        class="px-4 py-2 rounded-lg text-white transition-colors"
+                        style="background-color: ${config.secondary_action_color || defaultConfig.secondary_action_color}; font-size: ${baseSize * 0.9}px; font-family: ${fontFamily};"
+                        onmouseover="this.style.opacity='0.9'"
+                        onmouseout="this.style.opacity='1'">
+                  ← Quay Lại
+                </button>
+                <div style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  Câu ${currentQuestionIndex + 1}/${getTotalQuestions()}
+                  ${isShuffled ? ' 🔀' : ''}
+                  ${instantFeedback ? ' ⚡' : ''}
+                </div>
+              </div>
+
+              <div class="rounded-lg shadow-lg p-8 mb-6" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                <h2 class="font-semibold mb-6" style="font-size: ${baseSize * 1.3}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  ${q.question}
+                </h2>
+
+                <div class="space-y-3">
+                  ${options.map(opt => {
+                    const optionText = q[`option_${opt.toLowerCase()}`];
+                    if (!optionText) return '';
+                    const isSelected = userAnswer === opt;
+                    const isCorrect = opt === q.correct_answer;
+                    
+                    let bgColor = 'transparent';
+                    let borderColor = config.secondary_action_color || defaultConfig.secondary_action_color;
+                    let textColor = config.text_color || defaultConfig.text_color;
+                    let icon = '';
+                    
+                    if (showFeedback) {
+                      if (isSelected && isCorrect) {
+                        bgColor = '#10b981'; // green
+                        borderColor = '#10b981';
+                        textColor = '#ffffff';
+                        icon = '✓ ';
+                      } else if (isSelected && !isCorrect) {
+                        bgColor = '#ef4444'; // red
+                        borderColor = '#ef4444';
+                        textColor = '#ffffff';
+                        icon = '✗ ';
+                      } else if (!isSelected && isCorrect) {
+                        bgColor = '#d1fae5'; // light green
+                        borderColor = '#10b981';
+                        icon = '✓ ';
+                      }
+                    } else if (isSelected) {
+                      bgColor = config.primary_action_color || defaultConfig.primary_action_color;
+                      borderColor = config.primary_action_color || defaultConfig.primary_action_color;
+                      textColor = '#ffffff';
+                    }
+                    
+                    return `
+                      <button onclick="selectAnswer('${opt}')"
+                              ${showFeedback ? 'disabled' : ''}
+                              class="w-full p-4 rounded-lg text-left transition-all border-2"
+                              style="font-size: ${baseSize}px; font-family: ${fontFamily}; 
+                                     color: ${textColor};
+                                     background-color: ${bgColor};
+                                     border-color: ${borderColor};
+                                     cursor: ${showFeedback ? 'default' : 'pointer'};"
+                              onmouseover="if (!${isSelected} && !${showFeedback}) this.style.backgroundColor='${config.background_color || defaultConfig.background_color}'"
+                              onmouseout="if (!${isSelected} && !${showFeedback}) this.style.backgroundColor='transparent'">
+                        <span class="font-semibold">${icon}${opt}.</span> ${optionText}
+                      </button>
+                    `;
+                  }).join('')}
+                </div>
+
+                ${showFeedback ? `
+                  <div class="mt-6 p-4 rounded-lg" style="background-color: ${userAnswer === q.correct_answer ? '#d1fae5' : '#fee2e2'}; border-left: 4px solid ${userAnswer === q.correct_answer ? '#10b981' : '#ef4444'};">
+                    <div class="font-semibold mb-1" style="font-size: ${baseSize * 1.1}px; font-family: ${fontFamily}; color: ${userAnswer === q.correct_answer ? '#065f46' : '#991b1b'};">
+                      ${userAnswer === q.correct_answer ? '🎉 Chính xác!' : '❌ Chưa đúng'}
+                    </div>
+                    ${userAnswer !== q.correct_answer ? `
+                      <div style="font-size: ${baseSize * 0.9}px; font-family: ${fontFamily}; color: #991b1b;">
+                        Đáp án đúng là: <strong>${q.correct_answer}</strong>
+                      </div>
+                    ` : ''}
+                  </div>
+                ` : ''}
+              </div>
+
+              <div class="flex gap-4">
+                <button onclick="previousQuestion()" 
+                        ${currentQuestionIndex === quizStartIndex ? 'disabled' : ''}
+                        class="px-6 py-3 rounded-lg text-white transition-colors"
+                        style="background-color: ${config.secondary_action_color || defaultConfig.secondary_action_color}; 
+                               font-size: ${baseSize}px; font-family: ${fontFamily};
+                               opacity: ${currentQuestionIndex === quizStartIndex ? '0.5' : '1'};
+                               cursor: ${currentQuestionIndex === quizStartIndex ? 'not-allowed' : 'pointer'};"
+                        onmouseover="if (${currentQuestionIndex !== quizStartIndex}) this.style.opacity='0.9'"
+                        onmouseout="if (${currentQuestionIndex !== quizStartIndex}) this.style.opacity='1'">
+                  ← Câu Trước
+                </button>
+
+                ${currentQuestionIndex < quizEndIndex ? `
+                  <button onclick="nextQuestion()" 
+                          class="flex-1 py-3 rounded-lg text-white font-semibold transition-colors"
+                          style="background-color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-size: ${baseSize}px; font-family: ${fontFamily};"
+                          onmouseover="this.style.opacity='0.9'"
+                          onmouseout="this.style.opacity='1'">
+                    Câu Tiếp ��
+                  </button>
+                ` : `
+                  <button onclick="submitQuiz()" 
+                          class="flex-1 py-3 rounded-lg text-white font-semibold transition-colors"
+                          style="background-color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-size: ${baseSize}px; font-family: ${fontFamily};"
+                          onmouseover="this.style.opacity='0.9'"
+                          onmouseout="this.style.opacity='1'">
+                    Nộp Bài
+                  </button>
+                `}
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (currentView === 'results') {
+        const score = calculateScore();
+        const total = getTotalQuestions();
+        const percentage = Math.round((score / total) * 100);
+        
+        app.innerHTML = `
+          <div class="w-full min-h-full p-8">
+            <div class="max-w-4xl mx-auto">
+              <div class="rounded-lg shadow-lg p-8 mb-6 text-center" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                <h1 class="font-bold mb-4" style="font-size: ${baseSize * 2}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  Kết Quả Bài Thi
+                </h1>
+                <div class="text-6xl font-bold mb-2" style="color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-family: ${fontFamily};">
+                  ${score}/${total}
+                </div>
+                <p style="font-size: ${baseSize * 1.2}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.8;">
+                  Điểm: ${percentage}%
+                </p>
+                <p style="font-size: ${baseSize * 0.9}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color}; opacity: 0.6; margin-top: 8px;">
+                  Câu ${quizStartIndex + 1} - ${quizEndIndex + 1}
+                </p>
+              </div>
+
+              <div class="rounded-lg shadow-lg p-8 mb-6" style="background-color: ${config.surface_color || defaultConfig.surface_color};">
+                <h2 class="font-semibold mb-4" style="font-size: ${baseSize * 1.5}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                  Chi Tiết
+                </h2>
+                <div class="space-y-6 max-h-96 overflow-y-auto">
+                  ${questions.slice(quizStartIndex, quizEndIndex + 1).map((q, relIndex) => {
+                    const index = quizStartIndex + relIndex;
+                    const userAnswer = userAnswers[index];
+                    const isCorrect = userAnswer === q.correct_answer;
+                    const options = ['A', 'B', 'C', 'D'];
+                    
+                    return `
+                      <div class="p-5 rounded-lg border-2" style="background-color: ${config.background_color || defaultConfig.background_color}; border-color: ${isCorrect ? '#10b981' : '#ef4444'};">
+                        <div class="flex items-start gap-3 mb-4">
+                          <span style="font-size: ${baseSize * 1.5}px;">${isCorrect ? '✅' : '❌'}</span>
+                          <div class="flex-1">
+                            <p class="font-semibold mb-1" style="font-size: ${baseSize * 1.1}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                              Câu ${index + 1}
+                            </p>
+                            <p class="font-medium mb-3" style="font-size: ${baseSize}px; font-family: ${fontFamily}; color: ${config.text_color || defaultConfig.text_color};">
+                              ${q.question}
+                            </p>
+                          </div>
+                        </div>
+                        
+                        <div class="space-y-2 ml-12">
+                          ${options.map(opt => {
+                            const optionText = q[`option_${opt.toLowerCase()}`];
+                            if (!optionText) return '';
+                            
+                            const isUserAnswer = userAnswer === opt;
+                            const isCorrectAnswer = opt === q.correct_answer;
+                            
+                            let bgColor = 'transparent';
+                            let textColor = config.text_color || defaultConfig.text_color;
+                            let borderColor = config.secondary_action_color || defaultConfig.secondary_action_color;
+                            let icon = '';
+                            let fontWeight = 'normal';
+                            
+                            if (isCorrectAnswer) {
+                              bgColor = '#d1fae5';
+                              borderColor = '#10b981';
+                              textColor = '#065f46';
+                              icon = '✓ ';
+                              fontWeight = 'bold';
+                            } else if (isUserAnswer && !isCorrectAnswer) {
+                              bgColor = '#fee2e2';
+                              borderColor = '#ef4444';
+                              textColor = '#991b1b';
+                              icon = '✗ ';
+                              fontWeight = 'bold';
+                            }
+                            
+                            return `
+                              <div class="p-3 rounded-lg border-2" 
+                                   style="background-color: ${bgColor}; 
+                                          border-color: ${borderColor}; 
+                                          color: ${textColor};
+                                          font-family: ${fontFamily};
+                                          font-size: ${baseSize * 0.9}px;
+                                          font-weight: ${fontWeight};">
+                                <span class="font-bold">${icon}${opt}.</span> ${optionText}
+                              </div>
+                            `;
+                          }).join('')}
+                        </div>
+                        
+                        <div class="mt-3 ml-12 p-3 rounded" style="background-color: ${isCorrect ? '#d1fae5' : '#fef3c7'}; font-size: ${baseSize * 0.85}px; font-family: ${fontFamily};">
+                          ${userAnswer ? 
+                            (isCorrect ? 
+                              `<span style="color: #065f46; font-weight: bold;">🎉 Chính xác!</span>` : 
+                              `<span style="color: #92400e;">Bạn đã chọn: <strong style="color: #991b1b;">${userAnswer}</strong> | Đáp án đúng: <strong style="color: #065f46;">${q.correct_answer}</strong></span>`
+                            ) : 
+                            `<span style="color: #92400e;">Chưa trả lời | Đáp án đúng: <strong style="color: #065f46;">${q.correct_answer}</strong></span>`
+                          }
+                        </div>
+                      </div>
+                    `;
+                  }).join('')}
+                </div>
+              </div>
+
+              <button onclick="backToUpload()" 
+                      class="w-full py-4 rounded-lg font-semibold text-white transition-colors"
+                      style="background-color: ${config.primary_action_color || defaultConfig.primary_action_color}; font-size: ${baseSize * 1.1}px; font-family: ${fontFamily};"
+                      onmouseover="this.style.opacity='0.9'"
+                      onmouseout="this.style.opacity='1'">
+                Làm Bài Mới
+              </button>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    const dataHandler = {
+      onDataChanged(data) {
+        questions = data.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+        render();
+      }
+    };
+
+    async function onConfigChange(config) {
+      render();
+    }
+
+    window.elementSdk.init({
+      defaultConfig,
+      onConfigChange,
+      mapToCapabilities: (config) => ({
+        recolorables: [
+          {
+            get: () => config.background_color || defaultConfig.background_color,
+            set: (value) => {
+              config.background_color = value;
+              window.elementSdk.setConfig({ background_color: value });
+            }
+          },
+          {
+            get: () => config.surface_color || defaultConfig.surface_color,
+            set: (value) => {
+              config.surface_color = value;
+              window.elementSdk.setConfig({ surface_color: value });
+            }
+          },
+          {
+            get: () => config.text_color || defaultConfig.text_color,
+            set: (value) => {
+              config.text_color = value;
+              window.elementSdk.setConfig({ text_color: value });
+            }
+          },
+          {
+            get: () => config.primary_action_color || defaultConfig.primary_action_color,
+            set: (value) => {
+              config.primary_action_color = value;
+              window.elementSdk.setConfig({ primary_action_color: value });
+            }
+          },
+          {
+            get: () => config.secondary_action_color || defaultConfig.secondary_action_color,
+            set: (value) => {
+              config.secondary_action_color = value;
+              window.elementSdk.setConfig({ secondary_action_color: value });
+            }
+          }
+        ],
+        borderables: [],
+        fontEditable: {
+          get: () => config.font_family || defaultConfig.font_family,
+          set: (value) => {
+            config.font_family = value;
+            window.elementSdk.setConfig({ font_family: value });
+          }
+        },
+        fontSizeable: {
+          get: () => config.font_size || defaultConfig.font_size,
+          set: (value) => {
+            config.font_size = value;
+            window.elementSdk.setConfig({ font_size: value });
+          }
+        }
+      }),
+      mapToEditPanelValues: (config) => new Map([
+        ["app_title", config.app_title || defaultConfig.app_title],
+        ["upload_instruction", config.upload_instruction || defaultConfig.upload_instruction]
+      ])
+    });
+
+    window.dataSdk.init(dataHandler).then(result => {
+      if (result.isOk) {
+        render();
+      } else {
+        showToast('Lỗi khi khởi tạo ứng dụng', 'error');
+      }
+    });
+  </script>
+ <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'9aa4c4d3c09c3e5f',t:'MTc2NTExODMyOS4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
